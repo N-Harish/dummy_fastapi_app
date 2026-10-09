@@ -17,7 +17,7 @@ A successful build proves little. The job is done only when the container has be
 - Never overwrite an existing `Dockerfile` or `.dockerignore`: review it and propose changes.
 - Never put secrets in an image (`ENV`, `ARG`, `COPY .env`). Use runtime env vars or `RUN --mount=type=secret`.
 - No `--privileged`, no docker.sock mounts, no `docker system prune`, no `docker push` unless asked. Only remove containers you created (label `skill=docker-build`).
-- Don't edit application source without saying why. Pin base image tags and install from lockfiles.
+- Don't edit application source or dependency files (`requirements.txt`, `package.json`, `pyproject.toml`) to make the image work if a Dockerfile change can do it. If an edit is unavoidable, list it prominently in the report. Pin base image tags and install from lockfiles.
 
 ## 1. Preflight and safe branch
 
@@ -128,7 +128,7 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=15s \
 CMD ["node","dist/server.js"]
 ```
 
-Python: `builder` stage creates `/opt/venv` with `pip install -r requirements.txt`; `runtime` is `python:3.12-slim`, copies `/opt/venv`, creates user 10001, runs `gunicorn -b 0.0.0.0:8000 app:app` (never the Flask/Django dev server). Java: `maven:3.9-eclipse-temurin-21` build → `eclipse-temurin:21-jre` runtime, `JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75`. Rust: dummy-`main.rs` build to cache deps, then real build → `distroless/cc`. .NET: `sdk` publish → `aspnet`, `USER $APP_UID`. Static site: Node build → `nginxinc/nginx-unprivileged` (port 8080).
+Python: `builder` stage creates `/opt/venv` with `pip install -r requirements.txt`; `runtime` is `python:3.12-slim`, copies `/opt/venv`, creates user 10001, runs `gunicorn -b 0.0.0.0:8000 app:app` for WSGI apps (Flask/Django; never their dev servers). **FastAPI/Starlette are ASGI**: run `uvicorn app.main:app --host 0.0.0.0 --port 8000` (already a dependency), or gunicorn with `-k uvicorn.workers.UvicornWorker`; plain gunicorn sync workers return 500s on ASGI apps. If `uv.lock`/`poetry.lock` exists, install from it (`uv sync --frozen --no-dev`, keep `uv.lock` out of `.dockerignore`) instead of an unpinned `requirements.txt`, and take test dependencies from the lock's dev group, not ad hoc `pip install pytest`. Java: `maven:3.9-eclipse-temurin-21` build → `eclipse-temurin:21-jre` runtime, `JAVA_TOOL_OPTIONS=-XX:MaxRAMPercentage=75`. Rust: dummy-`main.rs` build to cache deps, then real build → `distroless/cc`. .NET: `sdk` publish → `aspnet`, `USER $APP_UID`. Static site: Node build → `nginxinc/nginx-unprivileged` (port 8080).
 
 If a Dockerfile already exists, don't rewrite it: build it, then report problems by severity (secrets baked in > runs as root > unpinned/`latest` base > single-stage shipping build tools > no `.dockerignore` > cache-unfriendly order > no healthcheck).
 
@@ -168,11 +168,13 @@ If any static check prints FAIL, look at the listed paths: decide whether each i
 ```bash
 CID=$(docker run -d --label skill=docker-build -p 127.0.0.1::$PORT --env-file .env.example "$TAG")
 HPORT=$(docker port "$CID" $PORT/tcp | head -1 | awk -F: '{print $NF}')
+OK=0
 for i in $(seq 60); do
-  [ "$(docker inspect -f '{{.State.Running}}' "$CID")" = true ] || { echo "FAIL: exited"; docker logs --tail 30 "$CID"; break; }
+  [ "$(docker inspect -f '{{.State.Running}}' "$CID")" = true ] || { echo "FAIL: exited"; docker logs --tail 30 "$CID"; OK=2; break; }
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "http://127.0.0.1:$HPORT$HP")
-  [ "$code" = 200 ] && { echo "PASS: $HP -> $code after ${i}s"; break; }; sleep 1
+  [ "$code" = 200 ] && { echo "PASS: $HP -> $code after ${i}s"; OK=1; break; }; sleep 1
 done
+[ "$OK" = 0 ] && { echo "FAIL: $HP still returned $code after 60s"; docker logs --tail 40 "$CID"; }   # a silent loop end is a failure
 docker inspect -f 'health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CID"
 S=$SECONDS; docker stop -t 10 "$CID" >/dev/null
 echo "stop took $((SECONDS-S))s exit=$(docker inspect -f '{{.State.ExitCode}}' "$CID")"   # exit 137 or ~10s = SIGTERM ignored
@@ -206,4 +208,4 @@ Files created: Dockerfile, .dockerignore
 Assumptions: port 3000 from src/server.ts:12; no DB needed to boot
 Run:    docker run --rm -p 3000:3000 --env-file .env myapp:latest
 ```
-Include how to review or discard: `git status` to review, `git switch main && git branch -D docker/containerize-20261009-1030` to throw it away (only the user decides; don't run it). Mention anything the user must supply (real env vars) and that a `-dirty` tag means uncommitted changes were built.
+Finish by offering (don't do it unasked) to commit the new files on the branch: `git add Dockerfile .dockerignore <any modified files> && git commit -m "Add Dockerfile"`. Explain why: uncommitted files are not tied to any branch and follow you when you switch branches, and `git branch -D` does not delete them. To review use `git status`. To discard: if committed, `git switch <original> && git branch -D <branch>`; if not committed, also `rm Dockerfile .dockerignore` and `git restore <modified files>`. Only the user decides; don't run these. List old image tags from earlier attempts (`docker image ls <name>`) so the user can `docker rmi` them. Mention anything the user must supply (real env vars) and that a `-dirty` tag means uncommitted changes were built.
